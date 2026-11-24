@@ -80,6 +80,7 @@ button:focus-visible{outline:3px solid var(--signal);outline-offset:2px}
 .rail[data-status="arming"] .grid i.on{background:var(--px-on);animation:blink .6s steps(2,start) infinite}
 .rail[data-status="done"] .grid i.on{background:var(--signal)}
 @keyframes blink{50%{opacity:.25}}
+.ver{font:500 10px/1 var(--mono);color:#7C838C;letter-spacing:.08em}
 .sound{height:44px;padding:0 16px;border-radius:22px;border:1px solid var(--rail-line);background:transparent;color:var(--rail-text);font-size:13px}
 
 .editor{position:absolute;inset:0;z-index:5;background:rgba(20,23,27,.97);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:16px;text-align:center}
@@ -131,6 +132,7 @@ button:focus-visible{outline:3px solid var(--signal);outline-offset:2px}
       <button class="cube" id="cube" type="button"><span class="screen"><span class="grid" id="grid" aria-hidden="true"></span></span></button>
     </div>
     <button class="sound" id="soundBtn" type="button" aria-pressed="true">Sonido activado</button>
+    <div class="ver">v5</div>
     <div class="editor" id="editor" hidden>
       <p>Minutos para esta posición</p>
       <output id="edVal">25</output>
@@ -461,8 +463,12 @@ button:focus-visible{outline:3px solid var(--signal);outline-offset:2px}
 
   /* Sonido y pantalla encendida */
   var ac = null, wl = null, soundBtn = $('soundBtn');
-  function paintSound(){ soundBtn.setAttribute('aria-pressed', T.sound); soundBtn.textContent = T.sound ? 'Sonido activado' : 'Sonido apagado'; }
-  soundBtn.addEventListener('click', function(){ gesture(); T.sound = !T.sound; paintSound(); saveT(); if(T.sound) chime(true); });
+  function paintSound(){ soundBtn.setAttribute('aria-pressed', T.sound); soundBtn.textContent = !T.sound ? 'Sonido apagado' : (blocked ? 'Toca para activar el sonido' : 'Sonido activado'); }
+  soundBtn.addEventListener('click', function(){
+    gesture();
+    if(blocked && T.sound){ blocked = false; paintSound(); chime(); return; }
+    T.sound = !T.sound; blocked = false; paintSound(); saveT(); if(T.sound) chime();
+  });
   function lockScreen(){
     try{
       if('wakeLock' in navigator && (!wl || wl.released) && document.visibilityState === 'visible'){
@@ -477,32 +483,71 @@ button:focus-visible{outline:3px solid var(--signal);outline-offset:2px}
     }catch(e){}
     lockScreen();
   }
-  /* iOS solo habilita el audio al soltar un toque (no al iniciarlo), así que se desbloquea aquí */
-  var primed = false;
+  /* Alarma: un elemento de audio desbloqueado con el primer toque puede sonar después sin otro gesto (iOS). WebAudio queda de respaldo. */
+  try{ if(navigator.audioSession) navigator.audioSession.type = 'transient'; }catch(e){}
+  var NOTES = [[659.25,0],[880,0.32],[659.25,1.0],[880,1.32]];
+  function makeWav(){
+    var sr = 22050, lead = 0.2, n = Math.floor(sr*(lead + 2.35));
+    var buf = new ArrayBuffer(44 + n*2), v = new DataView(buf);
+    function str(o, s){ for(var i = 0; i < s.length; i++) v.setUint8(o+i, s.charCodeAt(i)); }
+    str(0,'RIFF'); v.setUint32(4, 36+n*2, true); str(8,'WAVE'); str(12,'fmt '); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+    v.setUint32(24,sr,true); v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true); str(36,'data'); v.setUint32(40,n*2,true);
+    for(var i = 0; i < n; i++){
+      var t = i/sr - lead, smp = 0;
+      for(var k = 0; k < NOTES.length; k++){ var dt = t - NOTES[k][1]; if(dt >= 0 && dt < 1){ smp += Math.sin(2*Math.PI*NOTES[k][0]*dt) * Math.min(1, dt/0.02) * Math.exp(-dt*4.5); } }
+      v.setInt16(44+i*2, Math.max(-1, Math.min(1, smp*0.55))*32767, true);
+    }
+    var bytes = new Uint8Array(buf), bin = '';
+    for(var j = 0; j < bytes.length; j += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(j, j+8192));
+    return 'data:audio/wav;base64,' + btoa(bin);
+  }
+  var alarm = null, alarmOk = false, ringing = false, blocked = false, primed = false;
+  try{ alarm = new Audio(makeWav()); alarm.preload = 'auto'; alarm.addEventListener('ended', function(){ ringing = false; }); }catch(e){ alarm = null; }
   function gesture(){
     unlock();
-    if(!ac) return;
     try{
-      if(ac.state !== 'running') ac.resume().catch(function(){});
-      if(!primed){ var b = ac.createBuffer(1, 1, 22050), s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(0); primed = true; }
+      if(ac){
+        if(ac.state !== 'running') ac.resume().catch(function(){});
+        if(!primed){ var b = ac.createBuffer(1, 1, 22050), s = ac.createBufferSource(); s.buffer = b; s.connect(ac.destination); s.start(0); primed = true; }
+      }
     }catch(e){}
+    if(alarm && !alarmOk && !ringing && alarm.paused){
+      try{
+        var p = alarm.play();
+        if(p && p.then) p.then(function(){ alarmOk = true; if(!ringing){ alarm.pause(); alarm.currentTime = 0; } }).catch(function(){});
+      }catch(e){}
+    }
   }
   ['pointerup','touchend','click'].forEach(function(t){ document.addEventListener(t, gesture, true); });
-  function chime(preview){
-    if(!T.sound || !ac) return;
-    if(ac.state !== 'running'){ try{ ac.resume().then(function(){ playChime(preview); }).catch(function(){}); }catch(e){} }
-    else playChime(preview);
+  function markBlocked(){ blocked = true; paintSound(); }
+  function chime(){
+    if(!T.sound) return;
+    if(alarm){
+      try{
+        ringing = true; alarm.currentTime = 0;
+        var p = alarm.play();
+        if(p && p.then) p.then(function(){ alarmOk = true; }).catch(function(){ ringing = false; chimeWA(); });
+        return;
+      }catch(e){ ringing = false; }
+    }
+    chimeWA();
   }
-  function playChime(preview){
+  function chimeWA(){
+    if(!ac){ markBlocked(); return; }
+    if(ac.state === 'running'){ playChime(); return; }
+    try{ ac.resume().catch(function(){}); }catch(e){}
+    setTimeout(function(){ if(ac.state === 'running') playChime(); else markBlocked(); }, 300);
+  }
+  function playChime(){
     try{
       var t = ac.currentTime + 0.05;
-      (preview ? [[659.25,0],[880,0.32]] : [[659.25,0],[880,0.32],[659.25,1.0],[880,1.32]]).forEach(function(n){
+      NOTES.forEach(function(n){
         var o = ac.createOscillator(), gn = ac.createGain();
         o.type = 'sine'; o.frequency.value = n[0];
-        gn.gain.setValueAtTime(0.0001, t+n[1]); gn.gain.exponentialRampToValueAtTime(0.2, t+n[1]+0.03); gn.gain.exponentialRampToValueAtTime(0.0001, t+n[1]+0.9);
+        gn.gain.setValueAtTime(0.0001, t+n[1]); gn.gain.exponentialRampToValueAtTime(0.25, t+n[1]+0.03); gn.gain.exponentialRampToValueAtTime(0.0001, t+n[1]+0.9);
         o.connect(gn); gn.connect(ac.destination); o.start(t+n[1]); o.stop(t+n[1]+0.95);
       });
-    }catch(e){}
+    }catch(e){ markBlocked(); }
   }
   document.addEventListener('visibilitychange', function(){ if(document.visibilityState === 'visible'){ lockScreen(); tick(); } });
 
